@@ -16,6 +16,7 @@ const SMTP_USER = process.env.SMTP_USER || '';
 const SMTP_PASS = process.env.SMTP_PASS || '';
 const TRIGGER_TO_EMAIL = process.env.TRIGGER_TO_EMAIL || '';
 const TRIGGER_SUBJECT = process.env.TRIGGER_SUBJECT || 'MOXING_PEEK';
+const SMTP_TIMEOUT_MS = Number(process.env.SMTP_TIMEOUT_MS || 10_000);
 const FRESH_MS = Number(process.env.FRESH_MS || 60_000);
 const WAIT_MS = Number(process.env.WAIT_MS || 45_000);
 const PEEK_DIR = process.env.PEEK_DIR || '/tmp/moxing-peeks';
@@ -109,6 +110,13 @@ async function latestPeekAfter(ts) {
   return list.filter(x => x.ts > ts).sort((a, b) => b.ts - a.ts)[0] || null;
 }
 
+function withTimeout(promise, ms, label = 'operation') {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms + 1000)),
+  ]);
+}
+
 async function sendTriggerMail() {
   if (!SMTP_USER || !SMTP_PASS || !TRIGGER_TO_EMAIL) {
     throw new Error('SMTP_USER, SMTP_PASS, and TRIGGER_TO_EMAIL must be configured');
@@ -119,14 +127,17 @@ async function sendTriggerMail() {
     port: SMTP_PORT,
     secure: SMTP_SECURE,
     auth: { user: SMTP_USER, pass: SMTP_PASS },
+    connectionTimeout: SMTP_TIMEOUT_MS,
+    greetingTimeout: SMTP_TIMEOUT_MS,
+    socketTimeout: SMTP_TIMEOUT_MS,
   });
 
-  await transporter.sendMail({
+  await withTimeout(transporter.sendMail({
     from: SMTP_USER,
     to: TRIGGER_TO_EMAIL,
     subject: TRIGGER_SUBJECT,
     text: `peek ${Date.now()}`,
-  });
+  }), SMTP_TIMEOUT_MS, 'SMTP sendMail');
 }
 
 function sleep(ms) {
@@ -170,6 +181,7 @@ app.get('/api/health', async (req, res) => {
       SMTP_USER: Boolean(SMTP_USER),
       SMTP_PASS: Boolean(SMTP_PASS),
       TRIGGER_TO_EMAIL: Boolean(TRIGGER_TO_EMAIL),
+      SMTP_TIMEOUT_MS,
     },
     latest: latest ? { id: latest.id, ts: latest.ts, app: latest.app, bytes: latest.bytes } : null,
   });
@@ -183,9 +195,19 @@ app.post('/api/peek', requireUpload, express.raw({ type: '*/*', limit: '15mb' })
   res.json({ ok: true, id: item.id, ts: item.ts, bytes: item.bytes });
 });
 
-app.get('/api/trigger', requireView, async (req, res) => {
-  await sendTriggerMail();
-  res.json({ ok: true, sent: true, subject: TRIGGER_SUBJECT, to: TRIGGER_TO_EMAIL });
+app.get('/api/trigger', requireView, async (req, res, next) => {
+  try {
+    await sendTriggerMail();
+    res.json({ ok: true, sent: true, subject: TRIGGER_SUBJECT, to: TRIGGER_TO_EMAIL });
+  } catch (err) {
+    console.error('trigger mail failed:', err);
+    res.status(500).json({ ok: false, error: err.message || 'trigger mail failed' });
+  }
+});
+
+app.get('/api/trigger-async', requireView, async (req, res) => {
+  sendTriggerMail().catch(err => console.error('async trigger mail failed:', err));
+  res.json({ ok: true, queued: true, subject: TRIGGER_SUBJECT, to: TRIGGER_TO_EMAIL });
 });
 
 app.get('/api/latest', requireView, async (req, res) => {
@@ -206,7 +228,12 @@ app.get('/api/see', requireView, async (req, res) => {
   }
 
   const started = Date.now();
-  await sendTriggerMail();
+  try {
+    await sendTriggerMail();
+  } catch (err) {
+    console.error('see trigger mail failed:', err);
+    return res.status(500).json({ ok: false, error: err.message || 'trigger mail failed' });
+  }
 
   while (Date.now() < started + WAIT_MS) {
     await sleep(1500);
